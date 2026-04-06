@@ -690,27 +690,36 @@ def main():
     mask_zip_path = Path(__file__).parent / "storage_mask.zip"
     use_mask = False
     bg_whiteness = 0.7
+    clipped_geojson = None
+    clipped_meta = None
     
     if mask_zip_path.exists():
-        try:
-            with open(mask_zip_path, "rb") as f:
-                mask_bytes = f.read()
-            with st.spinner("Clipping counties to CO₂ storage mask..."):
-                clipped_geojson, clipped_meta = build_clipped_geojson(mask_bytes, include_territories)
-            n_clipped = len(clipped_meta)
-            st.sidebar.success(f"✓ {n_clipped} county fragments inside CO₂ storage zones")
-            use_mask = True
-            bg_whiteness = st.sidebar.slider(
-                "Background counties (outside mask)",
-                min_value=0.0,
-                max_value=1.0,
-                value=0.7,
-                step=0.05,
-                help="0 = full colors visible, 1 = totally white/hidden"
-            )
-        except Exception as e:
-            st.sidebar.error(f"Could not load mask: {e}")
-            use_mask = False
+        apply_mask = st.sidebar.checkbox(
+            "Apply CO₂ storage mask overlay",
+            value=False,
+            help="Clips county polygons to confirmed CO₂ storage sites. Disable this while adjusting weights for faster re-renders."
+        )
+        
+        if apply_mask:
+            try:
+                with open(mask_zip_path, "rb") as f:
+                    mask_bytes = f.read()
+                with st.spinner("Clipping counties to CO₂ storage mask..."):
+                    clipped_geojson, clipped_meta = build_clipped_geojson(mask_bytes, include_territories)
+                n_clipped = len(clipped_meta)
+                st.sidebar.success(f"✓ {n_clipped} county fragments inside CO₂ storage zones")
+                use_mask = True
+                bg_whiteness = st.sidebar.slider(
+                    "Background counties (outside mask)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.7,
+                    step=0.05,
+                    help="0 = full colors visible, 1 = totally white/hidden"
+                )
+            except Exception as e:
+                st.sidebar.error(f"Could not load mask: {e}")
+                use_mask = False
     else:
         st.sidebar.info("📦 storage_mask.zip not found in app directory")
     
@@ -754,7 +763,7 @@ def main():
     with st.spinner("Preparing map geometry..."):
         geojson_dict, counties_meta = build_geojson(include_territories)
     bg_geojson, bg_meta = geojson_dict, counties_meta
-    if use_mask:
+    if use_mask and clipped_geojson is not None and clipped_meta is not None:
         geojson_dict, counties_meta = clipped_geojson, clipped_meta
 
     # Create and display map
