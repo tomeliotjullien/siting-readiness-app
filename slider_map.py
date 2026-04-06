@@ -440,6 +440,62 @@ def export_results_csv(df: pd.DataFrame, weights: Dict[str, float]) -> str:
     return csv_with_header
 
 
+def initialize_weight_state() -> None:
+    """Initialize widget/session state for all weight controls once."""
+    default_weight = 100.0 / len(SCORE_COLUMNS)
+
+    for col in SCORE_COLUMNS:
+        weight_key = f"weight_{col}"
+        slider_key = f"slider_{col}"
+        input_key = f"input_{col}"
+        toggle_key = f"toggle_{col}"
+
+        if weight_key not in st.session_state:
+            st.session_state[weight_key] = default_weight
+        if slider_key not in st.session_state:
+            st.session_state[slider_key] = st.session_state[weight_key]
+        if input_key not in st.session_state:
+            st.session_state[input_key] = st.session_state[weight_key]
+        if toggle_key not in st.session_state:
+            st.session_state[toggle_key] = False
+
+
+def sync_weight_from_slider(col: str) -> None:
+    """Keep the number input and stored weight aligned with the slider."""
+    value = st.session_state[f"slider_{col}"]
+    st.session_state[f"weight_{col}"] = value
+    st.session_state[f"input_{col}"] = value
+
+
+def sync_weight_from_input(col: str) -> None:
+    """Keep the slider and stored weight aligned with the number input."""
+    value = st.session_state[f"input_{col}"]
+    st.session_state[f"weight_{col}"] = value
+    st.session_state[f"slider_{col}"] = value
+
+
+def handle_solo_toggle(col: str) -> None:
+    """When a solo toggle is enabled, set that weight to 100 and all others to 0."""
+    if not st.session_state.get(f"toggle_{col}"):
+        return
+
+    for other in SCORE_COLUMNS:
+        value = 100.0 if other == col else 0.0
+        st.session_state[f"weight_{other}"] = value
+        st.session_state[f"slider_{other}"] = value
+        st.session_state[f"input_{other}"] = value
+        st.session_state[f"toggle_{other}"] = (other == col)
+
+
+def set_all_weights(value: float) -> None:
+    """Set every weight control to the same percentage value."""
+    for col in SCORE_COLUMNS:
+        st.session_state[f"weight_{col}"] = value
+        st.session_state[f"slider_{col}"] = value
+        st.session_state[f"input_{col}"] = value
+        st.session_state[f"toggle_{col}"] = False
+
+
 def main():
     """Main Streamlit application."""
     
@@ -501,6 +557,7 @@ def main():
     
     # Sidebar controls
     st.sidebar.subheader("2. Weight Configuration")
+    initialize_weight_state()
     
     # Normalize toggle
     normalize_weights = st.sidebar.checkbox(
@@ -514,23 +571,14 @@ def main():
     col1, col2 = st.sidebar.columns(2)
     
     if col1.button("Equal Weights"):
-        for col in SCORE_COLUMNS:
-            st.session_state[f"weight_{col}"] = 100 / len(SCORE_COLUMNS)
-    
+        set_all_weights(100.0 / len(SCORE_COLUMNS))
+
     if col2.button("Reset to 50"):
-        for col in SCORE_COLUMNS:
-            st.session_state[f"weight_{col}"] = 50
+        set_all_weights(50.0)
     
     # Weight sliders
     st.sidebar.markdown("**Adjust Weights:**")
     weights = {}
-    
-    # Initialize session_State weights on first load
-    for col in SCORE_COLUMNS:
-        if f"weight_{col}" not in st.session_state:
-            st.session_state[f"weight_{col}"] = 100 / len(SCORE_COLUMNS)  # Equal initial weights
-        if f"toggle_{col}" not in st.session_state:
-            st.session_state[f"toggle_{col}"] = False  # All toggles start off
     
     for col in SCORE_COLUMNS:
         # Create shorter label for slider
@@ -540,44 +588,30 @@ def main():
                  .replace(" Vulnerability PCT", " Vuln.")
                  .replace(" PCT", ""))
         
-        # Initialize session state if not exists (stored as 0-100 percentage)
-        if f"weight_{col}" not in st.session_state:
-            st.session_state[f"weight_{col}"] = 100 / len(SCORE_COLUMNS)
-        
-        # Solo toggle: set this column to 100, all others to 0
         solo_col, slider_col, input_col = st.sidebar.columns([0.8, 2, 0.8], gap="small")
 
         with solo_col:
             st.markdown("<div style='padding-top:22px'></div>", unsafe_allow_html=True)
-            # Create a callback function to handle mutual exclusivity
-            def handle_solo_toggle(col_key):
-                def callback():
-                    if st.session_state.get(f"toggle_{col_key}"):
-                        # Turn on this column, turn off all others
-                        for other in SCORE_COLUMNS:
-                            st.session_state[f"weight_{other}"] = 100.0 if other == col_key else 0.0
-                            st.session_state[f"toggle_{other}"] = (other == col_key)
-                return callback
-            
             st.toggle(
                 "Solo",
                 key=f"toggle_{col}",
                 help=f"Toggle: set {label} = 100, all others = 0",
-                on_change=handle_solo_toggle(col)
+                on_change=handle_solo_toggle,
+                args=(col,)
             )
 
         # Slider in middle column (0-100 percentage scale)
         with slider_col:
-            weight_pct = st.slider(
+            st.slider(
                 label,
                 min_value=0.0,
                 max_value=100.0,
-                value=float(st.session_state[f"weight_{col}"]),
                 step=0.01,
                 key=f"slider_{col}",
-                help=f"Direction: {DIRECTION_CONFIG[col]}"
+                help=f"Direction: {DIRECTION_CONFIG[col]}",
+                on_change=sync_weight_from_slider,
+                args=(col,)
             )
-            weight = weight_pct / 100.0  # Convert to 0-1 scale
         
         # Number input in right column (0-100 percentage scale)
         with input_col:
@@ -588,21 +622,19 @@ def main():
                     input[type="number"] { max-width: 70px; }
                 </style>
             """, unsafe_allow_html=True)
-            weight_input_pct = st.number_input(
+            st.number_input(
                 " ",
                 min_value=0.0,
                 max_value=100.0,
-                value=weight_pct,  # Use slider value as default
                 step=0.01,
                 key=f"input_{col}",
                 label_visibility="collapsed",
-                help="Manual weight input (0-100)"
+                help="Manual weight input (0-100)",
+                on_change=sync_weight_from_input,
+                args=(col,)
             )
-            # Update weight from number input (it overrides slider if user changed it)
-            weight = weight_input_pct
         
-        weights[col] = weight  # Store as 0-100 percentage
-        st.session_state[f"weight_{col}"] = weight_input_pct  # Store as 0-100 percentage
+        weights[col] = st.session_state[f"weight_{col}"]
     
     # Display weight sum (as percentage 0-900 for 9 columns)
     weight_sum = sum(weights.values())
