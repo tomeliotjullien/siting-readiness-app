@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+.env
+.env.*
+*.log
+temp_counties/
+*.zip.tmp
