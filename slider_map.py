@@ -693,7 +693,33 @@ def main():
     clipped_geojson = None
     clipped_meta = None
     
+    # Determine mask source
+    mask_source_options = []
     if mask_zip_path.exists():
+        mask_source_options.append("Use default file")
+    mask_source_options.append("Upload custom mask")
+    
+    if mask_source_options:
+        mask_source = st.sidebar.radio(
+            "Mask source:",
+            mask_source_options,
+            horizontal=False
+        )
+    else:
+        mask_source = None
+    
+    mask_zip_file = None
+    
+    if mask_source == "Upload custom mask":
+        mask_zip_file = st.sidebar.file_uploader(
+            "Upload CO₂ storage mask (ZIP with shapefile)",
+            type=['zip']
+        )
+    elif mask_source == "Use default file" and mask_zip_path.exists():
+        mask_zip_file = str(mask_zip_path)
+    
+    # Only show the apply mask checkbox if a mask is available
+    if mask_zip_file is not None:
         apply_mask = st.sidebar.checkbox(
             "Apply CO₂ storage mask overlay",
             value=False,
@@ -702,8 +728,13 @@ def main():
         
         if apply_mask:
             try:
-                with open(mask_zip_path, "rb") as f:
-                    mask_bytes = f.read()
+                # Read file content
+                if isinstance(mask_zip_file, str):
+                    with open(mask_zip_file, "rb") as f:
+                        mask_bytes = f.read()
+                else:
+                    mask_bytes = mask_zip_file.read()
+                
                 with st.spinner("Clipping counties to CO₂ storage mask..."):
                     clipped_geojson, clipped_meta = build_clipped_geojson(mask_bytes, include_territories)
                 n_clipped = len(clipped_meta)
@@ -721,7 +752,7 @@ def main():
                 st.sidebar.error(f"Could not load mask: {e}")
                 use_mask = False
     else:
-        st.sidebar.info("📦 storage_mask.zip not found in app directory")
+        st.sidebar.info("📦 No mask available. Upload a ZIP shapefile to enable masking.")
     
     # Export options
     st.sidebar.subheader("4. Export")
