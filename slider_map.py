@@ -250,10 +250,14 @@ def compute_composite(
     
     df_result['composite_score'] = composite
     
-    # Convert to percentile rank (0-1, where higher = worse)
-    # rank(pct=True) automatically handles NaN and ties appropriately
-    composite_percentile = pd.Series(composite).rank(pct=True).values
-    df_result['composite_percentile'] = composite_percentile
+    # Min-max normalization to [0, 1] (higher = worse)
+    c_min = composite.min()
+    c_max = composite.max()
+    if c_max > c_min:
+        composite_normalized = (composite - c_min) / (c_max - c_min)
+    else:
+        composite_normalized = np.zeros_like(composite)
+    df_result['composite_normalized'] = composite_normalized
     
     return df_result
 
@@ -276,7 +280,7 @@ def make_choropleth_map(
     """
     # Join scores to pre-built county metadata (plain DataFrame merge, very fast)
     risk_cols = [f"{col}_risk" for col in SCORE_COLUMNS if f"{col}_risk" in scores_df.columns]
-    merge_cols = ['GEOID', 'composite_score', 'composite_percentile'] + risk_cols
+    merge_cols = ['GEOID', 'composite_score', 'composite_normalized'] + risk_cols
     data_df = counties_meta.merge(scores_df[merge_cols], on='GEOID', how='left')
 
     land_color = "rgb(255, 255, 255)" if use_mask else "rgb(243, 243, 243)"
@@ -285,7 +289,7 @@ def make_choropleth_map(
     if use_mask and bg_geojson is not None and bg_meta is not None:
         # Merge scores onto full county list for real colors in background
         risk_cols_bg = [f"{col}_risk" for col in SCORE_COLUMNS if f"{col}_risk" in scores_df.columns]
-        merge_cols_bg = ['GEOID', 'composite_score', 'composite_percentile'] + risk_cols_bg
+        merge_cols_bg = ['GEOID', 'composite_score', 'composite_normalized'] + risk_cols_bg
         bg_df = bg_meta.merge(scores_df[merge_cols_bg], on='GEOID', how='left')
 
         fig = go.Figure()
@@ -293,7 +297,7 @@ def make_choropleth_map(
             geojson=bg_geojson,
             locations=bg_df['GEOID'].tolist(),
             featureidkey="properties.GEOID",
-            z=bg_df['composite_percentile'].tolist(),
+            z=bg_df['composite_normalized'].tolist(),
             colorscale=color_scale,
             zmin=0, zmax=1,
             showscale=False,
@@ -305,26 +309,26 @@ def make_choropleth_map(
         ))
         # Main clipped choropleth on top (always fully opaque)
         risk_cols = [f"{col}_risk" for col in SCORE_COLUMNS if f"{col}_risk" in scores_df.columns]
-        merge_cols = ['GEOID', 'composite_score', 'composite_percentile'] + risk_cols
+        merge_cols = ['GEOID', 'composite_score', 'composite_normalized'] + risk_cols
         data_df = counties_meta.merge(scores_df[merge_cols], on='GEOID', how='left')
         fig.add_trace(go.Choropleth(
             geojson=geojson_dict,
             locations=data_df['GEOID'].tolist(),
             featureidkey="properties.GEOID",
-            z=data_df['composite_percentile'].tolist(),
+            z=data_df['composite_normalized'].tolist(),
             colorscale=color_scale,
             zmin=0, zmax=1,
             marker_opacity=1.0,
             marker_line_width=0.3,
             marker_line_color="white",
             colorbar=dict(
-                title="Risk Percentile<br>(0-100%)",
+                title="Normalized Risk<br>(0-1)",
                 thicknessmode="pixels", thickness=15,
                 lenmode="pixels", len=300,
-                tickformat=".0%"
+                tickformat=".2f"
             ),
             hovertext=data_df['NAME'],
-            hovertemplate="<b>%{hovertext}</b><br>Risk Percentile: %{z:.1%}<extra></extra>",
+            hovertemplate="<b>%{hovertext}</b><br>Normalized Risk: %{z:.3f}<extra></extra>",
             name="CO₂ storage counties",
         ))
         fig.update_layout(
@@ -344,7 +348,7 @@ def make_choropleth_map(
 
     # --- No mask: standard single-trace choropleth ---
     risk_cols = [f"{col}_risk" for col in SCORE_COLUMNS if f"{col}_risk" in scores_df.columns]
-    merge_cols = ['GEOID', 'composite_score', 'composite_percentile'] + risk_cols
+    merge_cols = ['GEOID', 'composite_score', 'composite_normalized'] + risk_cols
     data_df = counties_meta.merge(scores_df[merge_cols], on='GEOID', how='left')
 
     fig = px.choropleth(
@@ -352,12 +356,12 @@ def make_choropleth_map(
         geojson=geojson_dict,
         featureidkey="properties.GEOID",
         locations='GEOID',
-        color='composite_percentile',
+        color='composite_normalized',
         color_continuous_scale=color_scale,
         range_color=[0, 1],
         hover_name='NAME',
         hover_data={col: ':.3f' for col in data_df.columns if col not in ('GEOID', 'NAME')},
-        labels={'composite_percentile': 'Risk Percentile'},
+        labels={'composite_normalized': 'Normalized Risk'},
         title=f"US County Siting Risk Score (Higher = Worse)<br><sub>Weights: {format_weights_short(weights)}</sub>"
     )
 
@@ -376,12 +380,12 @@ def make_choropleth_map(
             lakecolor="rgb(240, 248, 255)"
         ),
         coloraxis_colorbar=dict(
-            title="Risk Percentile<br>(0-100%)",
+            title="Normalized Risk<br>(0-1)",
             thicknessmode="pixels",
             thickness=15,
             lenmode="pixels",
             len=300,
-            tickformat=".0%"
+            tickformat=".2f"
         )
     )
 
@@ -418,9 +422,9 @@ def export_weights_json(weights: Dict[str, float], normalize: bool) -> str:
 
 
 def export_results_csv(df: pd.DataFrame, weights: Dict[str, float]) -> str:
-    """Export county results with composite scores and percentile rankings to CSV string."""
+    """Export county results with composite scores and normalized scores to CSV string."""
     # Select relevant columns
-    export_cols = ['GEOID', 'County', 'composite_score', 'composite_percentile']
+    export_cols = ['GEOID', 'County', 'composite_score', 'composite_normalized']
     
     # Add risk columns
     for col in SCORE_COLUMNS:
@@ -782,13 +786,13 @@ def main():
     with col1:
         st.metric("Counties", len(scores_with_composite))
     with col2:
-        st.metric("Min Percentile", f"{scores_with_composite['composite_percentile'].min():.1%}")
+        st.metric("Min Score", f"{scores_with_composite['composite_normalized'].min():.3f}")
     with col3:
-        st.metric("Mean Percentile", f"{scores_with_composite['composite_percentile'].mean():.1%}")
+        st.metric("Mean Score", f"{scores_with_composite['composite_normalized'].mean():.3f}")
     with col4:
-        st.metric("Max Percentile", f"{scores_with_composite['composite_percentile'].max():.1%}")
+        st.metric("Max Score", f"{scores_with_composite['composite_normalized'].max():.3f}")
     with col5:
-        st.metric("Std Dev", f"{scores_with_composite['composite_percentile'].std():.3f}")
+        st.metric("Std Dev", f"{scores_with_composite['composite_normalized'].std():.3f}")
     
     # Build GeoJSON (cached per territory setting — skips geometry work on re-runs)
     with st.spinner("Preparing map geometry..."):
@@ -825,7 +829,7 @@ def main():
     
     # Display sample data
     with st.expander("📊 View Sample Data"):
-        display_cols = ['GEOID', 'County', 'composite_score', 'composite_percentile'] + [
+        display_cols = ['GEOID', 'County', 'composite_score', 'composite_normalized'] + [
             f"{col}_risk" for col in SCORE_COLUMNS if f"{col}_risk" in scores_with_composite.columns
         ]
         
