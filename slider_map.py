@@ -1,8 +1,12 @@
 """
-Interactive County Siting Score Visualization Tool
+Interactive County Siting Readiness Visualization Tool
 
-This Streamlit app loads county-level siting scores and displays an interactive
-choropleth map of US counties with adjustable weights for composite scoring.
+This Streamlit app loads county-level indicator scores and displays an interactive,
+binned choropleth map of the **County Siting Readiness Index**.
+
+Interpretation of the index:
+    - lower score  = higher readiness
+    - higher score = lower readiness / greater deployment constraint
 
 Usage:
     streamlit run slider_map.py
@@ -14,89 +18,162 @@ Requirements:
 import streamlit as st
 import pandas as pd
 import geopandas as gpd
-import plotly.express as px
 import plotly.graph_objects as go
+from plotly.colors import sample_colorscale
 import requests
 import json
 from pathlib import Path
 from io import BytesIO
 from zipfile import ZipFile
-from typing import Dict, Tuple
+from typing import Dict, List
 import numpy as np
 import os
+import hashlib
 import tempfile
 
-# Configuration: Column directionality
-# All columns: higher value = higher risk (no inversion applied — raw CSV values used as-is)
-DIRECTION_CONFIG = {
-    "Social Vulnerability PCT": "higher_worse",
-    "Extreme Events (Wildfires, Floodings, Storms) PCT": "higher_worse",
-    "Labor Availability PCT": "higher_worse",
-    "Water Availability": "higher_worse",
-    "Sequestration Access (EOR/Pipeline/Primacy)": "higher_worse",
-    "Interconnection Queue": "higher_worse",
-    "Land Cost": "higher_worse",
-    "State Project Enablement Index PCT": "higher_worse",
-    "Long-Haul Fiber Optics Presence": "higher_worse"
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+# Raw CSV column name for the optional Community Context Layer.
+COMMUNITY_COLUMN = "Community Context PCT"
+
+# Main indicators (all raw CSV columns except the Community Context Layer).
+MAIN_INDICATORS: List[str] = [
+    "State Project Enablement Index PCT",
+    "Interconnection Queue",
+    "Relevant Workforce Availability",
+    "Land Cost",
+    "Long-Haul Fiber Optics Presence",
+    "Extreme Events (Wildfires, Floodings, Storms) PCT",
+    "Water Availability",
+    "Sequestration Access (EOR/Pipeline/Primacy)",
+]
+
+# Every raw indicator column that participates in the index.
+RAW_COLUMNS: List[str] = [COMMUNITY_COLUMN] + MAIN_INDICATORS
+
+# Clean UI labels (paper terminology) mapped from the faithful raw CSV columns.
+# Backend keeps the raw CSV column names; only the UI shows these clean names.
+DISPLAY_NAMES: Dict[str, str] = {
+    "Community Context PCT": "Community Context Layer",
+    "State Project Enablement Index PCT": "State Project Enablement",
+    "Interconnection Queue": "Interconnection Queue",
+    "Relevant Workforce Availability": "Labor Availability",
+    "Land Cost": "Land Cost",
+    "Long-Haul Fiber Optics Presence": "Long-Haul Fiber Optic",
+    "Extreme Events (Wildfires, Floodings, Storms) PCT": "Extreme Events",
+    "Water Availability": "Water Availability",
+    "Sequestration Access (EOR/Pipeline/Primacy)": "Sequestration Access",
 }
 
-SCORE_COLUMNS = list(DIRECTION_CONFIG.keys())
+# Three default paper scenarios. Weights are percentages that sum to 100 per
+# scenario. The Community Context Layer is 0 in every default scenario — it is
+# controlled separately by the user.
+SCENARIOS: Dict[str, Dict[str, float]] = {
+    "Storage-First Readiness": {
+        "Community Context PCT": 0.00,
+        "State Project Enablement Index PCT": 16.67,
+        "Interconnection Queue": 19.44,
+        "Relevant Workforce Availability": 5.56,
+        "Land Cost": 8.33,
+        "Long-Haul Fiber Optics Presence": 2.78,
+        "Extreme Events (Wildfires, Floodings, Storms) PCT": 11.11,
+        "Water Availability": 13.89,
+        "Sequestration Access (EOR/Pipeline/Primacy)": 22.22,
+    },
+    "Grid-Speed Readiness": {
+        "Community Context PCT": 0.00,
+        "State Project Enablement Index PCT": 19.44,
+        "Interconnection Queue": 22.22,
+        "Relevant Workforce Availability": 13.89,
+        "Land Cost": 11.11,
+        "Long-Haul Fiber Optics Presence": 16.67,
+        "Extreme Events (Wildfires, Floodings, Storms) PCT": 2.78,
+        "Water Availability": 5.56,
+        "Sequestration Access (EOR/Pipeline/Primacy)": 8.33,
+    },
+    "Policy-and-Permitting Readiness": {
+        "Community Context PCT": 0.00,
+        "State Project Enablement Index PCT": 22.22,
+        "Interconnection Queue": 19.44,
+        "Relevant Workforce Availability": 11.11,
+        "Land Cost": 8.33,
+        "Long-Haul Fiber Optics Presence": 13.89,
+        "Extreme Events (Wildfires, Floodings, Storms) PCT": 2.78,
+        "Water Availability": 5.56,
+        "Sequestration Access (EOR/Pipeline/Primacy)": 16.67,
+    },
+}
 
-# Color scales available
-COLOR_SCALES = {
-    "Red-Yellow-Green (Reversed)": "RdYlGn_r",
-    "Red-Green (Reversed)": "RdGn_r",
-    "Reds": "Reds",
+DEFAULT_SCENARIO = "Storage-First Readiness"
+SCENARIO_ORDER = list(SCENARIOS.keys())
+
+# Community Context Layer perspectives.
+COMMUNITY_NOT_INCLUDED = "Not included"
+COMMUNITY_SOCIAL = "Social Vulnerability perspective"
+COMMUNITY_ECONOMIC = "Economic Development Need perspective"
+COMMUNITY_OPTIONS = [COMMUNITY_NOT_INCLUDED, COMMUNITY_SOCIAL, COMMUNITY_ECONOMIC]
+
+COMMUNITY_DESCRIPTION = (
+    "Social vulnerability can be interpreted in two directions. It may identify "
+    "communities requiring additional safeguards and engagement, or communities with "
+    "greater economic development need. For transparency, this layer is optional and "
+    "can be explored in either direction."
+)
+
+# Colorblind-friendly sequential palettes (no red-green scales).
+# Low index = higher readiness; high index = lower readiness.
+COLORBLIND_SCALES: Dict[str, str] = {
+    "Cividis": "Cividis",
     "Viridis": "Viridis",
+    "Blues": "Blues",
+    "YlOrBr": "YlOrBr",
     "Plasma": "Plasma",
-    "Turbo": "Turbo"
 }
+DEFAULT_PALETTE = "Cividis"
+
+# Fixed bin-size options.
+BIN_SIZE_OPTIONS = [0.1, 0.2, 0.25, 0.5]
+DEFAULT_BIN_SIZE = 0.2
+BIN_COUNT_OPTIONS = [4, 5, 10]
+DEFAULT_BIN_COUNT = 5
+
+READINESS_LEGEND_TITLE = "County Siting Readiness Index<br>Lower = higher readiness"
 
 
+# ---------------------------------------------------------------------------
+# Geometry loading / caching (unchanged core machinery)
+# ---------------------------------------------------------------------------
 @st.cache_data
 def load_counties_geometry() -> gpd.GeoDataFrame:
-    """
-    Download and cache US Census county boundaries.
-    Returns GeoDataFrame with GEOID as string (5-digit).
-    """
+    """Download and cache US Census county boundaries (GEOID as 5-digit string)."""
     url = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_county_500k.zip"
-    
+
     st.info("Downloading US Census county boundaries...")
     response = requests.get(url)
     response.raise_for_status()
-    
-    # Extract shapefile from zip
+
     with ZipFile(BytesIO(response.content)) as zip_file:
-        # Find the .shp file
         shp_files = [f for f in zip_file.namelist() if f.endswith('.shp')]
         if not shp_files:
             raise ValueError("No shapefile found in downloaded zip")
-        
-        # Extract all files to temporary location
+
         temp_dir = Path("temp_counties")
         temp_dir.mkdir(exist_ok=True)
         zip_file.extractall(temp_dir)
-        
-        # Read shapefile
         shp_path = temp_dir / shp_files[0]
         counties = gpd.read_file(shp_path)
-    
-    # Ensure GEOID is 5-digit string
+
     counties['GEOID'] = counties['GEOID'].astype(str).str.zfill(5)
-    
-    # Reproject to EPSG:5070 (Albers Equal Area for CONUS)
     counties = counties.to_crs("EPSG:5070")
-    
+
     st.success(f"Loaded {len(counties)} counties")
     return counties
 
 
 @st.cache_data
 def build_geojson(include_territories: bool) -> tuple:
-    """
-    Build and cache county GeoJSON + metadata for Plotly.
-    Expensive geometry ops run once per territory setting, then cached.
-    """
+    """Build and cache county GeoJSON + metadata for Plotly."""
     counties_gdf = load_counties_geometry()
     # Always exclude Puerto Rico (no data for that area)
     counties_gdf = counties_gdf[~counties_gdf['STATEFP'].isin(['72'])]
@@ -110,13 +187,7 @@ def build_geojson(include_territories: bool) -> tuple:
 
 @st.cache_data
 def build_clipped_geojson(mask_bytes: bytes, include_territories: bool) -> tuple:
-    """
-    True geometric intersection: clip county polygons to the CO₂ storage mask.
-    Counties outside the mask disappear entirely; counties that cross the boundary
-    are trimmed to their actual overlap area.
-    Returns (geojson_dict, counties_meta) in the same format as build_geojson().
-    Cached per file content + territory setting.
-    """
+    """Clip county polygons to a CO2 storage mask (true geometric intersection)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         zip_path = os.path.join(tmpdir, "mask.zip")
         with open(zip_path, "wb") as f:
@@ -132,20 +203,16 @@ def build_clipped_geojson(mask_bytes: bytes, include_territories: bool) -> tuple
     mask_gdf = mask_gdf.to_crs("EPSG:5070")
 
     counties_gdf = load_counties_geometry()  # already in EPSG:5070
-    # Always exclude Puerto Rico (no data for that area)
     counties_gdf = counties_gdf[~counties_gdf['STATEFP'].isin(['72'])]
     if not include_territories:
         counties_gdf = counties_gdf[~counties_gdf['STATEFP'].isin(['02', '15'])]
 
-    # True geometric intersection (clips county polygons to mask boundary)
     clipped = gpd.overlay(
         counties_gdf[['GEOID', 'NAME', 'geometry']],
-        mask_gdf[['geometry']].dissolve(),  # dissolve mask to a single polygon first
+        mask_gdf[['geometry']].dissolve(),
         how='intersection'
     )
-    # Dissolve by GEOID in case one county intersects multiple mask polygons
     clipped = clipped.dissolve(by='GEOID').reset_index()
-    # NAME may be lost after dissolve — rejoin it
     name_map = counties_gdf.set_index('GEOID')['NAME']
     clipped['NAME'] = clipped['GEOID'].map(name_map)
 
@@ -155,151 +222,227 @@ def build_clipped_geojson(mask_bytes: bytes, include_territories: bool) -> tuple
     return geojson_dict, counties_meta
 
 
+# ---------------------------------------------------------------------------
+# Data loading & scoring
+# ---------------------------------------------------------------------------
 @st.cache_data
-def load_scores_csv(file_path: str, fill_na_value: float = 0.5) -> pd.DataFrame:
-    """
-    Load scores CSV and prepare data.
-    
-    Args:
-        file_path: Path to CSV file
-        fill_na_value: Value to fill missing scores (default 0.5 = neutral)
-    
-    Returns:
-        DataFrame with GEOID (5-digit string) and score columns
-    """
+def load_scores_csv(file_path, fill_na_value: float = 0.5) -> pd.DataFrame:
+    """Load the scores CSV, normalize GEOID, and fill missing indicator values."""
     df = pd.read_csv(file_path)
-    
-    # Ensure FIPS is 5-digit GEOID
+
     if 'FIPS' in df.columns:
         df['GEOID'] = df['FIPS'].astype(str).str.zfill(5)
     elif 'GEOID' in df.columns:
         df['GEOID'] = df['GEOID'].astype(str).str.zfill(5)
     else:
         raise ValueError("CSV must have 'FIPS' or 'GEOID' column")
-    
-    # Check for missing score columns
-    missing_cols = [col for col in SCORE_COLUMNS if col not in df.columns]
+
+    missing_cols = [col for col in RAW_COLUMNS if col not in df.columns]
     if missing_cols:
         st.warning(f"Missing columns in CSV: {missing_cols}")
-    
-    # Fill missing values
-    for col in SCORE_COLUMNS:
+
+    for col in RAW_COLUMNS:
         if col in df.columns:
             missing_count = df[col].isna().sum()
             if missing_count > 0:
                 st.info(f"Filled {missing_count} missing values in '{col}' with {fill_na_value}")
                 df[col] = df[col].fillna(fill_na_value)
-    
+
     return df
 
 
-@st.cache_data
-def apply_directionality(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Copy score columns to _risk columns.
-    Raw values used as-is: higher value = higher risk, no inversion.
-    """
-    df_risk = df.copy()
-    for col in SCORE_COLUMNS:
-        if col in df.columns:
-            df_risk[f"{col}_risk"] = df[col]
-    return df_risk
-
-
-def compute_composite(
+def compute_index(
     df: pd.DataFrame,
     weights: Dict[str, float],
+    community_mode: str,
     normalize_weights: bool = True,
-    rescale_output: bool = False
 ) -> pd.DataFrame:
     """
-    Compute weighted composite siting risk score.
-    
-    Args:
-        df: DataFrame with _risk columns
-        weights: Dictionary of column: weight
-        normalize_weights: If True, normalize weights to sum to 1
-        rescale_output: If True, rescale final scores to [0,1] by min-max
-    
-    Returns:
-        DataFrame with 'composite_score' column added
+    Compute the weighted County Siting Readiness Index.
+
+    Interpretation: lower = higher readiness, higher = lower readiness / greater
+    deployment constraint.
+
+    Community Context Layer handling:
+        - "Not included": community weight forced to 0.
+        - "Social Vulnerability perspective": raw value used as-is (higher social
+          vulnerability increases the index -> lower readiness / greater need for
+          safeguards).
+        - "Economic Development Need perspective": value reversed via 1 - score
+          (higher social vulnerability interpreted as greater economic development
+          need / higher priority).
+
+    Active weights are normalized to sum to 1 before scoring.
     """
     df_result = df.copy()
-    
-    # Get risk column names
-    risk_cols = [f"{col}_risk" for col in SCORE_COLUMNS if f"{col}_risk" in df.columns]
-    
-    # Prepare weights array
-    w = np.array([weights.get(col.replace("_risk", ""), 0.0) for col in risk_cols])
-    
-    # Normalize weights if requested
+    cols = [c for c in RAW_COLUMNS if c in df.columns]
+
+    values = df_result[cols].astype(float).copy()
+    if COMMUNITY_COLUMN in values.columns and community_mode == COMMUNITY_ECONOMIC:
+        values[COMMUNITY_COLUMN] = 1.0 - values[COMMUNITY_COLUMN]
+
+    w = np.array([float(weights.get(c, 0.0)) for c in cols], dtype=float)
+
+    if community_mode == COMMUNITY_NOT_INCLUDED and COMMUNITY_COLUMN in cols:
+        w[cols.index(COMMUNITY_COLUMN)] = 0.0
+
     if normalize_weights and w.sum() > 0:
         w = w / w.sum()
-    
-    # Store normalized weights for display
-    df_result['weights_used'] = str({col.replace("_risk", ""): round(wt, 3) 
-                                      for col, wt in zip(risk_cols, w)})
-    
-    # Compute composite score
-    scores_array = df_result[risk_cols].values
-    composite = np.dot(scores_array, w)
-    
-    # Rescale if requested
-    if rescale_output and composite.max() > composite.min():
-        composite = (composite - composite.min()) / (composite.max() - composite.min())
-    
+
+    composite = values.values.dot(w)
     df_result['composite_score'] = composite
-    
-    # Min-max normalization to [0, 1] (higher = worse)
-    c_min = composite.min()
-    c_max = composite.max()
+
+    c_min, c_max = composite.min(), composite.max()
     if c_max > c_min:
-        composite_normalized = (composite - c_min) / (c_max - c_min)
+        df_result['composite_normalized'] = (composite - c_min) / (c_max - c_min)
     else:
-        composite_normalized = np.zeros_like(composite)
-    df_result['composite_normalized'] = composite_normalized
-    
+        df_result['composite_normalized'] = np.zeros_like(composite)
+
     return df_result
 
 
+# ---------------------------------------------------------------------------
+# Binning helpers
+# ---------------------------------------------------------------------------
+def _fmt_edge(x: float) -> str:
+    """Format a bin edge like 0.0, 0.2, 0.25."""
+    s = f"{x:.2f}".rstrip('0').rstrip('.')
+    if '.' not in s:
+        s += '.0'
+    return s
+
+
+def compute_bin_edges(
+    values: np.ndarray,
+    bin_mode: str,
+    bin_size: float,
+    n_bins: int,
+    quantile: bool,
+) -> List[float]:
+    """
+    Return bin edges over the score range [0, 1].
+
+    Score-based bins are used by default. If ``quantile`` is True, edges follow the
+    empirical quantiles of ``values`` (clamped to the [0, 1] display range).
+    """
+    if bin_mode == "Fixed bin size":
+        n = max(1, int(round(1.0 / bin_size)))
+    else:
+        n = int(n_bins)
+
+    if quantile and values.size > 0:
+        qs = np.linspace(0.0, 1.0, n + 1)
+        edges = np.quantile(values, qs)
+        edges[0], edges[-1] = 0.0, 1.0
+        edges = np.maximum.accumulate(edges)
+        edges = np.unique(edges)
+        if len(edges) < 2:
+            edges = np.array([0.0, 1.0])
+        return [float(e) for e in edges]
+
+    if bin_mode == "Fixed bin size":
+        edges = list(np.arange(0.0, 1.0 + 1e-9, bin_size))
+        if edges[-1] < 1.0 - 1e-9:
+            edges.append(1.0)
+        edges[-1] = 1.0
+    else:
+        edges = list(np.linspace(0.0, 1.0, n + 1))
+
+    return [float(e) for e in edges]
+
+
+def make_bin_labels(edges: List[float]) -> List[str]:
+    """Human-readable bin labels; first = highest readiness, last = lowest."""
+    n = len(edges) - 1
+    labels = []
+    for i in range(n):
+        base = f"{_fmt_edge(edges[i])}\u2013{_fmt_edge(edges[i + 1])}"
+        if i == 0:
+            base += " Highest readiness"
+        elif i == n - 1:
+            base += " Lowest readiness"
+        labels.append(base)
+    return labels
+
+
+def build_discrete_colorscale(n: int, palette: str) -> List:
+    """Build a stepped discrete colorscale for ``n`` bins from a named palette."""
+    positions = [(i + 0.5) / n for i in range(n)] if n > 1 else [0.5]
+    colors = sample_colorscale(palette, positions)
+    scale = []
+    for i, color in enumerate(colors):
+        scale.append([i / n, color])
+        scale.append([(i + 1) / n, color])
+    return scale
+
+
+def assign_bins(values: np.ndarray, edges: List[float]) -> np.ndarray:
+    """Assign each value to a bin index in [0, n-1]."""
+    n = len(edges) - 1
+    interior = np.array(edges[1:-1]) if n > 1 else np.array([])
+    idx = np.digitize(values, interior, right=False)
+    return np.clip(idx, 0, n - 1)
+
+
+# ---------------------------------------------------------------------------
+# Map rendering (binned, colorblind-friendly)
+# ---------------------------------------------------------------------------
 def make_choropleth_map(
     geojson_dict: dict,
     counties_meta: pd.DataFrame,
     scores_df: pd.DataFrame,
-    weights: Dict[str, float],
-    color_scale: str = "RdYlGn_r",
+    edges: List[float],
+    palette: str,
+    title: str,
+    height: int = 700,
+    show_colorbar: bool = True,
     use_mask: bool = False,
     bg_geojson: dict = None,
     bg_meta: pd.DataFrame = None,
     bg_whiteness: float = 0.7,
 ) -> go.Figure:
     """
-    Create interactive Plotly choropleth map of county composite scores.
-    When use_mask=True: clipped polygons drawn on top; full county set drawn below
-    with marker_opacity = 1 - bg_whiteness (0=fully colored, 1=totally white).
-    """
-    # Join scores to pre-built county metadata (plain DataFrame merge, very fast)
-    risk_cols = [f"{col}_risk" for col in SCORE_COLUMNS if f"{col}_risk" in scores_df.columns]
-    merge_cols = ['GEOID', 'composite_score', 'composite_normalized'] + risk_cols
-    data_df = counties_meta.merge(scores_df[merge_cols], on='GEOID', how='left')
+    Create an interactive binned choropleth of the County Siting Readiness Index.
 
+    Low bins mean higher readiness; high bins mean lower readiness / greater
+    deployment constraint. When ``use_mask`` is True, the clipped counties are drawn
+    on top and the full county set is drawn faintly below.
+    """
+    n = len(edges) - 1
+    labels = make_bin_labels(edges)
+    colorscale = build_discrete_colorscale(n, palette)
     land_color = "rgb(255, 255, 255)" if use_mask else "rgb(243, 243, 243)"
 
-    # Background trace: full county outlines at low opacity when mask is active
-    if use_mask and bg_geojson is not None and bg_meta is not None:
-        # Merge scores onto full county list for real colors in background
-        risk_cols_bg = [f"{col}_risk" for col in SCORE_COLUMNS if f"{col}_risk" in scores_df.columns]
-        merge_cols_bg = ['GEOID', 'composite_score', 'composite_normalized'] + risk_cols_bg
-        bg_df = bg_meta.merge(scores_df[merge_cols_bg], on='GEOID', how='left')
+    def prep(meta: pd.DataFrame) -> pd.DataFrame:
+        merged = meta.merge(
+            scores_df[['GEOID', 'composite_score', 'composite_normalized']],
+            on='GEOID', how='left'
+        )
+        vals = merged['composite_normalized'].fillna(0.0).values
+        merged['bin_idx'] = assign_bins(vals, edges)
+        merged['bin_label'] = [labels[i] for i in merged['bin_idx']]
+        return merged
 
-        fig = go.Figure()
+    colorbar = dict(
+        title=READINESS_LEGEND_TITLE,
+        tickmode="array",
+        tickvals=list(range(n)),
+        ticktext=labels,
+        thicknessmode="pixels", thickness=15,
+        lenmode="pixels", len=min(height - 100, 320),
+    ) if show_colorbar else None
+
+    fig = go.Figure()
+
+    if use_mask and bg_geojson is not None and bg_meta is not None:
+        bg_df = prep(bg_meta)
         fig.add_trace(go.Choropleth(
             geojson=bg_geojson,
             locations=bg_df['GEOID'].tolist(),
             featureidkey="properties.GEOID",
-            z=bg_df['composite_normalized'].tolist(),
-            colorscale=color_scale,
-            zmin=0, zmax=1,
+            z=bg_df['bin_idx'].tolist(),
+            colorscale=colorscale,
+            zmin=-0.5, zmax=n - 0.5,
             showscale=False,
             marker_opacity=max(0.0, 1.0 - bg_whiteness),
             marker_line_width=0.2,
@@ -307,560 +450,507 @@ def make_choropleth_map(
             hoverinfo="skip",
             name="Outside mask",
         ))
-        # Main clipped choropleth on top (always fully opaque)
-        risk_cols = [f"{col}_risk" for col in SCORE_COLUMNS if f"{col}_risk" in scores_df.columns]
-        merge_cols = ['GEOID', 'composite_score', 'composite_normalized'] + risk_cols
-        data_df = counties_meta.merge(scores_df[merge_cols], on='GEOID', how='left')
-        fig.add_trace(go.Choropleth(
-            geojson=geojson_dict,
-            locations=data_df['GEOID'].tolist(),
-            featureidkey="properties.GEOID",
-            z=data_df['composite_normalized'].tolist(),
-            colorscale=color_scale,
-            zmin=0, zmax=1,
-            marker_opacity=1.0,
-            marker_line_width=0.3,
-            marker_line_color="white",
-            colorbar=dict(
-                title="Normalized Risk<br>(0-1)",
-                thicknessmode="pixels", thickness=15,
-                lenmode="pixels", len=300,
-                tickformat=".2f"
-            ),
-            hovertext=data_df['NAME'],
-            hovertemplate="<b>%{hovertext}</b><br>Normalized Risk: %{z:.3f}<extra></extra>",
-            name="CO₂ storage counties",
-        ))
-        fig.update_layout(
-            title=f"US County Siting Risk Score (Higher = Worse)<br><sub>Weights: {format_weights_short(weights)}</sub>",
-            height=700,
-            margin=dict(l=0, r=0, t=80, b=0),
-            geo=dict(
-                scope="usa",
-                projection_type="albers usa",
-                showland=True,
-                landcolor=land_color,
-                showlakes=True,
-                lakecolor="rgb(240, 248, 255)",
-            )
-        )
-        return fig
 
-    # --- No mask: standard single-trace choropleth ---
-    risk_cols = [f"{col}_risk" for col in SCORE_COLUMNS if f"{col}_risk" in scores_df.columns]
-    merge_cols = ['GEOID', 'composite_score', 'composite_normalized'] + risk_cols
-    data_df = counties_meta.merge(scores_df[merge_cols], on='GEOID', how='left')
+    data_df = prep(counties_meta)
+    customdata = np.stack([
+        data_df['NAME'].astype(str).values,
+        data_df['composite_normalized'].fillna(0.0).values,
+        data_df['bin_label'].values,
+    ], axis=-1)
 
-    fig = px.choropleth(
-        data_df,
+    fig.add_trace(go.Choropleth(
         geojson=geojson_dict,
+        locations=data_df['GEOID'].tolist(),
         featureidkey="properties.GEOID",
-        locations='GEOID',
-        color='composite_normalized',
-        color_continuous_scale=color_scale,
-        range_color=[0, 1],
-        hover_name='NAME',
-        hover_data={col: ':.3f' for col in data_df.columns if col not in ('GEOID', 'NAME')},
-        labels={'composite_normalized': 'Normalized Risk'},
-        title=f"US County Siting Risk Score (Higher = Worse)<br><sub>Weights: {format_weights_short(weights)}</sub>"
-    )
-
-    fig.update_geos(
-        scope="usa",
-        projection_type="albers usa"
-    )
+        z=data_df['bin_idx'].tolist(),
+        colorscale=colorscale,
+        zmin=-0.5, zmax=n - 0.5,
+        showscale=show_colorbar,
+        marker_opacity=1.0,
+        marker_line_width=0.3,
+        marker_line_color="white",
+        colorbar=colorbar,
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Readiness Index: %{customdata[1]:.3f}<br>"
+            "Bin: %{customdata[2]}<extra></extra>"
+        ),
+        name="County Siting Readiness Index",
+    ))
 
     fig.update_layout(
-        height=700,
+        title=title,
+        height=height,
         margin=dict(l=0, r=0, t=80, b=0),
         geo=dict(
+            scope="usa",
+            projection_type="albers usa",
             showland=True,
             landcolor=land_color,
             showlakes=True,
-            lakecolor="rgb(240, 248, 255)"
+            lakecolor="rgb(240, 248, 255)",
         ),
-        coloraxis_colorbar=dict(
-            title="Normalized Risk<br>(0-1)",
-            thicknessmode="pixels",
-            thickness=15,
-            lenmode="pixels",
-            len=300,
-            tickformat=".2f"
-        )
     )
-
     return fig
 
 
+# ---------------------------------------------------------------------------
+# Formatting / export helpers
+# ---------------------------------------------------------------------------
 def format_weights_short(weights: Dict[str, float]) -> str:
-    """Format weights for display in title (shortened column names)."""
-    short_names = {
-        "Social Vulnerability PCT": "SocVuln",
-        "Extreme Events (Wildfires, Floodings, Storms) PCT": "ClimEvents",
-        "Labor Availability PCT": "Labor",
-        "Water Availability": "Water",
-        "Sequestration Access (EOR/Pipeline/Primacy)": "Sequest",
-        "Interconnection Queue": "Intercon",
-        "Land Cost": "LandCost",
-        "State Project Enablement Index PCT": "StateIdx",
-        "Long-Haul Fiber Optics Presence": "Fiber"
-    }
-    
-    formatted = ", ".join([f"{short_names.get(k, k)}: {v:.2f}".replace(',', '.') 
-                          for k, v in weights.items() if v > 0])
+    """Format active weights for a map subtitle using clean display names."""
+    formatted = ", ".join(
+        f"{DISPLAY_NAMES.get(k, k)}: {v:.2f}"
+        for k, v in weights.items() if v > 0
+    )
     return formatted if formatted else "All zeros"
 
 
-def export_weights_json(weights: Dict[str, float], normalize: bool) -> str:
-    """Export current weights configuration to JSON string."""
+def export_weights_json(
+    weights: Dict[str, float],
+    community_mode: str,
+    normalize: bool,
+) -> str:
+    """Export current weights configuration to a JSON string."""
     config = {
-        "weights": weights,
+        "weights": {DISPLAY_NAMES.get(k, k): v for k, v in weights.items()},
+        "community_context_layer": community_mode,
         "normalized": normalize,
-        "direction_config": DIRECTION_CONFIG
     }
     return json.dumps(config, indent=2)
 
 
 def export_results_csv(df: pd.DataFrame, weights: Dict[str, float]) -> str:
-    """Export county results with composite scores and normalized scores to CSV string."""
-    # Select relevant columns
-    export_cols = ['GEOID', 'County', 'composite_score', 'composite_normalized']
-    
-    # Add risk columns
-    for col in SCORE_COLUMNS:
-        risk_col = f"{col}_risk"
-        if risk_col in df.columns:
-            export_cols.append(risk_col)
-    
+    """Export county results with the readiness index and raw indicator values."""
+    export_cols = ['GEOID']
+    if 'County' in df.columns:
+        export_cols.append('County')
+    export_cols += ['composite_score', 'composite_normalized']
+    export_cols += [c for c in RAW_COLUMNS if c in df.columns]
+
     df_export = df[export_cols].copy()
-    
-    # Add weights as metadata in header comment
-    weights_str = ", ".join([f"{k}={v:.3f}" for k, v in weights.items()])
-    
-    # Convert to CSV
+    weights_str = ", ".join(
+        f"{DISPLAY_NAMES.get(k, k)}={v:.3f}" for k, v in weights.items()
+    )
     csv_str = df_export.to_csv(index=False)
-    csv_with_header = f"# Weights: {weights_str}\n{csv_str}"
-    
-    return csv_with_header
+    return f"# County Siting Readiness Index weights: {weights_str}\n{csv_str}"
 
 
+# ---------------------------------------------------------------------------
+# Session-state / weight controls
+# ---------------------------------------------------------------------------
 def initialize_weight_state() -> None:
-    """Initialize widget/session state for all weight controls once."""
-    default_weight = 100.0 / len(SCORE_COLUMNS)
-
-    for col in SCORE_COLUMNS:
-        weight_key = f"weight_{col}"
-        slider_key = f"slider_{col}"
-        input_key = f"input_{col}"
-        toggle_key = f"toggle_{col}"
-
-        if weight_key not in st.session_state:
-            st.session_state[weight_key] = default_weight
-        if slider_key not in st.session_state:
-            st.session_state[slider_key] = st.session_state[weight_key]
-        if input_key not in st.session_state:
-            st.session_state[input_key] = st.session_state[weight_key]
-        if toggle_key not in st.session_state:
-            st.session_state[toggle_key] = False
+    """Initialize slider/session state from the default scenario."""
+    defaults = SCENARIOS[DEFAULT_SCENARIO]
+    for col in MAIN_INDICATORS:
+        value = defaults[col]
+        for key in (f"weight_{col}", f"slider_{col}", f"input_{col}"):
+            if key not in st.session_state:
+                st.session_state[key] = value
+    if "community_weight" not in st.session_state:
+        st.session_state["community_weight"] = 10.0
 
 
 def sync_weight_from_slider(col: str) -> None:
-    """Keep the number input and stored weight aligned with the slider."""
     value = st.session_state[f"slider_{col}"]
     st.session_state[f"weight_{col}"] = value
     st.session_state[f"input_{col}"] = value
 
 
 def sync_weight_from_input(col: str) -> None:
-    """Keep the slider and stored weight aligned with the number input."""
     value = st.session_state[f"input_{col}"]
     st.session_state[f"weight_{col}"] = value
     st.session_state[f"slider_{col}"] = value
 
 
-def handle_solo_toggle(col: str) -> None:
-    """When a solo toggle is enabled, set that weight to 100 and all others to 0."""
-    if not st.session_state.get(f"toggle_{col}"):
+def apply_scenario() -> None:
+    """Load a scenario's weights into the sliders (no-op for 'Custom')."""
+    name = st.session_state.get("scenario_choice")
+    if name not in SCENARIOS:
         return
-
-    for other in SCORE_COLUMNS:
-        value = 100.0 if other == col else 0.0
-        st.session_state[f"weight_{other}"] = value
-        st.session_state[f"slider_{other}"] = value
-        st.session_state[f"input_{other}"] = value
-        st.session_state[f"toggle_{other}"] = (other == col)
-
-
-def set_all_weights(value: float) -> None:
-    """Set every weight control to the same percentage value."""
-    for col in SCORE_COLUMNS:
+    for col in MAIN_INDICATORS:
+        value = SCENARIOS[name][col]
         st.session_state[f"weight_{col}"] = value
         st.session_state[f"slider_{col}"] = value
         st.session_state[f"input_{col}"] = value
-        st.session_state[f"toggle_{col}"] = False
 
 
+def current_weights() -> Dict[str, float]:
+    """Read the current main-indicator weights from session state."""
+    return {col: st.session_state[f"weight_{col}"] for col in MAIN_INDICATORS}
+
+
+def short_label(col: str) -> str:
+    return DISPLAY_NAMES.get(col, col)
+
+
+# ---------------------------------------------------------------------------
+# Main application
+# ---------------------------------------------------------------------------
 def main():
-    """Main Streamlit application."""
-    
     st.set_page_config(
-        page_title="County Siting Risk Map",
+        page_title="County Siting Readiness Index",
         page_icon="🗺️",
-        layout="wide"
+        layout="wide",
     )
-    
-    st.title("🗺️ Interactive County Siting Score Visualization")
-    st.markdown("""
-    This tool visualizes county-level siting risk scores across the US.
-    Adjust the weights for each factor using the sliders to see how the composite risk changes.
-    """)
-    
-    # Sidebar for controls
+
+    st.title("🗺️ County Siting Readiness Index")
+    st.markdown(
+        "The app computes a **County Siting Readiness Index** using user-selected "
+        "indicator weights. The three default scenarios correspond to **Storage-First**, "
+        "**Grid-Speed**, and **Policy-and-Permitting** readiness. The Community Context "
+        "Layer is treated separately because social vulnerability can be interpreted "
+        "either as a need for additional safeguards or as an indicator of economic "
+        "development need.\n\n"
+        "_Interpretation: **lower score = higher readiness**; "
+        "**higher score = lower readiness / greater deployment constraint**._"
+    )
+
+    # --- Sidebar: 1. Data ---
     st.sidebar.header("⚙️ Configuration")
-    
-    # File upload or path input
     st.sidebar.subheader("1. Load Data")
-    
-    # Check if default file exists
+
     default_csv = Path(__file__).parent / "county_column_scores.csv"
-    
-    upload_option = st.sidebar.radio(
-        "Data source:",
-        ["Use default file", "Upload CSV"]
-    )
-    
+    upload_option = st.sidebar.radio("Data source:", ["Use default file", "Upload CSV"])
+
     csv_file = None
     if upload_option == "Upload CSV":
-        csv_file = st.sidebar.file_uploader(
-            "Upload county scores CSV",
-            type=['csv']
-        )
+        csv_file = st.sidebar.file_uploader("Upload county scores CSV", type=['csv'])
     elif default_csv.exists():
         csv_file = str(default_csv)
     else:
         st.error(f"Default file not found: {default_csv}")
         st.stop()
-    
+
     if csv_file is None:
         st.info("Please upload a CSV file to begin.")
         st.stop()
-    
-    # Load data
+
     try:
         with st.spinner("Loading county scores..."):
             scores_df = load_scores_csv(csv_file)
-        
         st.sidebar.success(f"✓ Loaded {len(scores_df)} counties with scores")
-
     except Exception as e:
         st.error(f"Error loading data: {e}")
         st.stop()
-    
-    # Apply directionality (cached — only runs once per CSV)
-    scores_df = apply_directionality(scores_df)
-    
-    # Sidebar controls
-    st.sidebar.subheader("2. Weight Configuration")
+
     initialize_weight_state()
-    
-    # Normalize toggle
-    normalize_weights = st.sidebar.checkbox(
-        "Normalize weights to sum = 1",
-        value=True,
-        help="When enabled, weights are automatically normalized so their sum equals 1"
+
+    # --- Sidebar: 2. Scenario ---
+    st.sidebar.subheader("2. Scenario")
+    st.sidebar.radio(
+        "Default scenario (sets indicator weights):",
+        ["Custom"] + SCENARIO_ORDER,
+        index=1 + SCENARIO_ORDER.index(DEFAULT_SCENARIO),
+        key="scenario_choice",
+        on_change=apply_scenario,
     )
-    
-    # Preset buttons
-    st.sidebar.markdown("**Quick Presets:**")
-    col1, col2 = st.sidebar.columns(2)
-    
-    if col1.button("Equal Weights"):
-        set_all_weights(100.0 / len(SCORE_COLUMNS))
 
-    if col2.button("Reset to 50"):
-        set_all_weights(50.0)
-    
-    # Weight sliders
-    st.sidebar.markdown("**Adjust Weights:**")
-    weights = {}
-    
-    for col in SCORE_COLUMNS:
-        # Create shorter label for slider
-        label = (col
-                 .replace(" (Wildfires, Floodings, Storms) PCT", "")
-                 .replace(" Availability PCT", "")
-                 .replace(" Vulnerability PCT", " Vuln.")
-                 .replace(" PCT", ""))
-        
-        solo_col, slider_col, input_col = st.sidebar.columns([0.8, 2, 0.8], gap="small")
+    # --- Sidebar: 3. Community Context Layer ---
+    st.sidebar.subheader("3. Community Context Layer")
+    st.sidebar.caption(COMMUNITY_DESCRIPTION)
+    community_mode = st.sidebar.radio(
+        "Community Context Layer:",
+        COMMUNITY_OPTIONS,
+        index=0,
+        key="community_mode",
+    )
+    community_weight = 0.0
+    if community_mode != COMMUNITY_NOT_INCLUDED:
+        community_weight = st.sidebar.slider(
+            "Community Context Layer weight (%)",
+            min_value=0.0, max_value=100.0, step=0.01,
+            key="community_weight",
+        )
 
-        with solo_col:
-            st.markdown("<div style='padding-top:22px'></div>", unsafe_allow_html=True)
-            st.toggle(
-                "Solo",
-                key=f"toggle_{col}",
-                help=f"Toggle: set {label} = 100, all others = 0",
-                on_change=handle_solo_toggle,
-                args=(col,)
-            )
+    # --- Sidebar: 4. Weights ---
+    st.sidebar.subheader("4. Weight Configuration")
+    normalize_weights = st.sidebar.checkbox(
+        "Normalize active weights to sum = 1",
+        value=True,
+        help="Active weights are normalized so they sum to 1 before computing the index.",
+    )
 
-        # Slider in middle column (0-100 percentage scale)
+    st.sidebar.markdown("**Adjust indicator weights:**")
+    st.sidebar.markdown(
+        "<style>input[type=\"number\"] { max-width: 80px; }</style>",
+        unsafe_allow_html=True,
+    )
+    for col in MAIN_INDICATORS:
+        slider_col, input_col = st.sidebar.columns([2.4, 0.9], gap="small")
         with slider_col:
             st.slider(
-                label,
-                min_value=0.0,
-                max_value=100.0,
-                step=0.01,
+                short_label(col),
+                min_value=0.0, max_value=100.0, step=0.01,
                 key=f"slider_{col}",
-                help=f"Direction: {DIRECTION_CONFIG[col]}",
                 on_change=sync_weight_from_slider,
-                args=(col,)
+                args=(col,),
             )
-        
-        # Number input in right column (0-100 percentage scale)
         with input_col:
-            # Display the current weight value as percentage, sync with slider
-            # Add custom CSS to make the input field smaller
-            st.markdown("""
-                <style>
-                    input[type="number"] { max-width: 70px; }
-                </style>
-            """, unsafe_allow_html=True)
+            st.markdown("<div style='padding-top:24px'></div>", unsafe_allow_html=True)
             st.number_input(
                 " ",
-                min_value=0.0,
-                max_value=100.0,
-                step=0.01,
+                min_value=0.0, max_value=100.0, step=0.01,
                 key=f"input_{col}",
                 label_visibility="collapsed",
-                help="Manual weight input (0-100)",
                 on_change=sync_weight_from_input,
-                args=(col,)
+                args=(col,),
             )
-        
-        weights[col] = st.session_state[f"weight_{col}"]
-    
-    # Display weight sum (as percentage 0-900 for 9 columns)
-    weight_sum = sum(weights.values())
+
+    weights_main = current_weights()
+    weights = dict(weights_main)
+    weights[COMMUNITY_COLUMN] = community_weight if community_mode != COMMUNITY_NOT_INCLUDED else 0.0
+
+    active_sum = sum(v for v in weights.values() if v > 0)
     if normalize_weights:
-        st.sidebar.info(f"**Weight sum:** {weight_sum:.0f} → normalized to 100")
+        st.sidebar.info(f"**Active weight sum:** {active_sum:.2f} → normalized to 1")
     else:
-        st.sidebar.info(f"**Weight sum:** {weight_sum:.0f}")
-    
-    # Calculate and display contribution percentages
-    if weight_sum > 0:
-        if normalize_weights:
-            contributions = {col: (w / weight_sum) * 100 for col, w in weights.items()}
-        else:
-            contributions = {col: (w / weight_sum) * 100 for col, w in weights.items()}
-        
-        st.sidebar.subheader("📊 Column Contributions")
-        
-        # Create a nicer display of contributions
-        for col in SCORE_COLUMNS:
-            contrib_pct = contributions[col]
-            # Only show columns with >0.1% contribution
-            if contrib_pct > 0.1:
-                short_name = (col
-                              .replace(" (Wildfires, Floodings, Storms) PCT", "")
-                              .replace(" Availability PCT", "")
-                              .replace(" Vulnerability PCT", " Vuln.")
-                              .replace(" PCT", ""))
-                st.sidebar.write(f"**{short_name}:** {contrib_pct:.1f}%".replace(',', '.'))
-    
-    # Map options
-    st.sidebar.subheader("3. Map Options")
-    
-    color_scale = st.sidebar.selectbox(
-        "Color scale:",
-        options=list(COLOR_SCALES.keys()),
-        index=0
+        st.sidebar.info(f"**Active weight sum:** {active_sum:.2f}")
+
+    # --- Sidebar: 5. Map binning options ---
+    st.sidebar.subheader("5. Map binning options")
+    bin_mode = st.sidebar.radio("Binning mode:", ["Fixed bin size", "Number of bins"], index=0)
+    bin_size = DEFAULT_BIN_SIZE
+    n_bins = DEFAULT_BIN_COUNT
+    if bin_mode == "Fixed bin size":
+        bin_size = st.sidebar.selectbox(
+            "Bin size:", BIN_SIZE_OPTIONS, index=BIN_SIZE_OPTIONS.index(DEFAULT_BIN_SIZE)
+        )
+    else:
+        n_bins = st.sidebar.selectbox(
+            "Number of bins:", BIN_COUNT_OPTIONS, index=BIN_COUNT_OPTIONS.index(DEFAULT_BIN_COUNT)
+        )
+    quantile_bins = st.sidebar.checkbox(
+        "Use quantile bins instead of score-based",
+        value=False,
+        help="Default is score-based (equal-width) bins over [0, 1].",
     )
-    
+
+    # --- Sidebar: 6. Color palette ---
+    st.sidebar.subheader("6. Color palette")
+    palette_name = st.sidebar.selectbox(
+        "Colorblind-friendly palette:",
+        list(COLORBLIND_SCALES.keys()),
+        index=list(COLORBLIND_SCALES.keys()).index(DEFAULT_PALETTE),
+    )
+    palette = COLORBLIND_SCALES[palette_name]
+
+    # --- Sidebar: 7. Map extent / mask ---
+    st.sidebar.subheader("7. Map Options")
     include_territories = st.sidebar.checkbox(
         "Include AK/HI",
         value=False,
-        help="Include Alaska and Hawaii in the map (Puerto Rico excluded due to lack of data)"
-    )
-    
-    rescale_output = st.sidebar.checkbox(
-        "Rescale scores to [0,1]",
-        value=False,
-        help="Apply min-max rescaling to final composite scores"
+        help="Include Alaska and Hawaii (Puerto Rico excluded due to lack of data).",
     )
 
-    # CO₂ storage mask
     st.sidebar.markdown("**CO₂ Underground Storage Mask:**")
     mask_zip_path = Path(__file__).parent / "storage_mask.zip"
-    use_mask = False
-    bg_whiteness = 0.7
-    clipped_geojson = None
-    clipped_meta = None
-    
-    # Determine mask source
     mask_source_options = []
     if mask_zip_path.exists():
         mask_source_options.append("Use default file")
     mask_source_options.append("Upload custom mask")
-    
-    if mask_source_options:
-        mask_source = st.sidebar.radio(
-            "Mask source:",
-            mask_source_options,
-            horizontal=False
-        )
-    else:
-        mask_source = None
-    
+    mask_source = st.sidebar.radio("Mask source:", mask_source_options)
+
     mask_zip_file = None
-    
     if mask_source == "Upload custom mask":
         mask_zip_file = st.sidebar.file_uploader(
-            "Upload CO₂ storage mask (ZIP with shapefile)",
-            type=['zip']
+            "Upload CO₂ storage mask (ZIP with shapefile)", type=['zip']
         )
     elif mask_source == "Use default file" and mask_zip_path.exists():
         mask_zip_file = str(mask_zip_path)
-    
-    # Only show the apply mask checkbox if a mask is available
+
+    apply_mask = False
+    bg_whiteness = 0.7
     if mask_zip_file is not None:
         apply_mask = st.sidebar.checkbox(
             "Apply CO₂ storage mask overlay",
             value=False,
-            help="Clips county polygons to confirmed CO₂ storage sites. Disable this while adjusting weights for faster re-renders."
+            help="Clips county polygons to confirmed CO₂ storage sites.",
         )
-        
         if apply_mask:
-            try:
-                # Read file content
-                if isinstance(mask_zip_file, str):
-                    with open(mask_zip_file, "rb") as f:
-                        mask_bytes = f.read()
-                else:
-                    mask_bytes = mask_zip_file.read()
-                
-                with st.spinner("Clipping counties to CO₂ storage mask..."):
-                    clipped_geojson, clipped_meta = build_clipped_geojson(mask_bytes, include_territories)
-                n_clipped = len(clipped_meta)
-                st.sidebar.success(f"✓ {n_clipped} county fragments inside CO₂ storage zones")
-                use_mask = True
-                bg_whiteness = st.sidebar.slider(
-                    "Background counties (outside mask)",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=0.7,
-                    step=0.05,
-                    help="0 = full colors visible, 1 = totally white/hidden"
-                )
-            except Exception as e:
-                st.sidebar.error(f"Could not load mask: {e}")
-                use_mask = False
+            bg_whiteness = st.sidebar.slider(
+                "Background counties (outside mask)",
+                min_value=0.0, max_value=1.0, value=0.7, step=0.05,
+                help="0 = full colors visible, 1 = totally white/hidden",
+            )
     else:
         st.sidebar.info("📦 No mask available. Upload a ZIP shapefile to enable masking.")
-    
-    # Export options
-    st.sidebar.subheader("4. Export")
-    
-    if st.sidebar.button("📥 Export Weights (JSON)"):
-        json_str = export_weights_json(weights, normalize_weights)
-        st.sidebar.download_button(
-            label="Download weights.json",
-            data=json_str,
-            file_name="siting_weights.json",
-            mime="application/json"
-        )
-    
-    # Main panel - compute and display
-    with st.spinner("Computing composite scores..."):
-        # Convert weights from 0-100 to 0-1 for compute_composite
-        weights_normalized = {col: w / 100.0 for col, w in weights.items()}
-        scores_with_composite = compute_composite(
-            scores_df,
-            weights_normalized,
-            normalize_weights=normalize_weights,
-            rescale_output=rescale_output
-        )
-    
-    # Statistics
-    col1, col2, col3, col4, col5 = st.columns(5)
-    with col1:
-        st.metric("Counties", len(scores_with_composite))
-    with col2:
-        st.metric("Min Score", f"{scores_with_composite['composite_normalized'].min():.3f}")
-    with col3:
-        st.metric("Mean Score", f"{scores_with_composite['composite_normalized'].mean():.3f}")
-    with col4:
-        st.metric("Max Score", f"{scores_with_composite['composite_normalized'].max():.3f}")
-    with col5:
-        st.metric("Std Dev", f"{scores_with_composite['composite_normalized'].std():.3f}")
-    
-    # Build GeoJSON (cached per territory setting — skips geometry work on re-runs)
-    with st.spinner("Preparing map geometry..."):
-        geojson_dict, counties_meta = build_geojson(include_territories)
-    bg_geojson, bg_meta = geojson_dict, counties_meta
-    if use_mask and clipped_geojson is not None and clipped_meta is not None:
-        geojson_dict, counties_meta = clipped_geojson, clipped_meta
 
-    # Create and display map
-    with st.spinner("Rendering map..."):
-        fig = make_choropleth_map(
-            geojson_dict,
-            counties_meta,
-            scores_with_composite,
-            weights,
-            color_scale=COLOR_SCALES[color_scale],
-            use_mask=use_mask,
-            bg_geojson=bg_geojson if use_mask else None,
-            bg_meta=bg_meta if use_mask else None,
-            bg_whiteness=bg_whiteness,
-        )
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Export results
-    if st.button("📥 Export County Results (CSV)"):
-        csv_str = export_results_csv(scores_with_composite, weights)
+    # Resolve mask bytes + identity for the config signature.
+    mask_bytes = None
+    mask_id = None
+    if apply_mask and mask_zip_file is not None:
+        if isinstance(mask_zip_file, str):
+            with open(mask_zip_file, "rb") as f:
+                mask_bytes = f.read()
+        else:
+            mask_bytes = mask_zip_file.getvalue()
+        mask_id = hashlib.md5(mask_bytes).hexdigest()
+
+    # --- Sidebar: 8. Update / export ---
+    st.sidebar.subheader("8. Update & Export")
+    update_clicked = st.sidebar.button("🔄 Update map", type="primary")
+
+    # Configuration signature: any change requires clicking "Update map".
+    current_config = {
+        "weights": {k: round(float(v), 4) for k, v in weights.items()},
+        "community_mode": community_mode,
+        "normalize": normalize_weights,
+        "include_territories": include_territories,
+        "apply_mask": apply_mask,
+        "mask_id": mask_id,
+        "bin_mode": bin_mode,
+        "bin_size": float(bin_size),
+        "n_bins": int(n_bins),
+        "quantile": quantile_bins,
+        "palette": palette_name,
+    }
+
+    need_first_render = "current_fig" not in st.session_state
+
+    if update_clicked or need_first_render:
+        with st.spinner("Computing County Siting Readiness Index and rendering map..."):
+            results = compute_index(scores_df, weights, community_mode, normalize_weights)
+
+            edges = compute_bin_edges(
+                results['composite_normalized'].values,
+                bin_mode, bin_size, n_bins, quantile_bins,
+            )
+
+            geojson_dict, counties_meta = build_geojson(include_territories)
+            bg_geojson, bg_meta = geojson_dict, counties_meta
+
+            use_mask = False
+            if apply_mask and mask_bytes is not None:
+                try:
+                    clipped_geojson, clipped_meta = build_clipped_geojson(mask_bytes, include_territories)
+                    geojson_dict, counties_meta = clipped_geojson, clipped_meta
+                    use_mask = True
+                except Exception as e:
+                    st.sidebar.error(f"Could not load mask: {e}")
+
+            title = (
+                "County Siting Readiness Index (Lower = higher readiness)"
+                f"<br><sub>Weights: {format_weights_short(weights)}</sub>"
+            )
+            fig = make_choropleth_map(
+                geojson_dict, counties_meta, results, edges, palette, title,
+                use_mask=use_mask,
+                bg_geojson=bg_geojson if use_mask else None,
+                bg_meta=bg_meta if use_mask else None,
+                bg_whiteness=bg_whiteness,
+            )
+
+        st.session_state["current_fig"] = fig
+        st.session_state["current_results"] = results
+        st.session_state["current_weights"] = weights
+        st.session_state["committed_config"] = current_config
+    elif st.session_state.get("committed_config") != current_config:
+        st.warning("Slider values changed. Click **Update map** to refresh results.")
+
+    results = st.session_state["current_results"]
+    committed_weights = st.session_state["current_weights"]
+
+    # --- Statistics ---
+    norm = results['composite_normalized']
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Counties", len(results))
+    c2.metric("Min Index", f"{norm.min():.3f}")
+    c3.metric("Mean Index", f"{norm.mean():.3f}")
+    c4.metric("Max Index", f"{norm.max():.3f}")
+    c5.metric("Std Dev", f"{norm.std():.3f}")
+
+    # --- Map ---
+    st.plotly_chart(st.session_state["current_fig"], use_container_width=True)
+
+    # --- Exports ---
+    exp1, exp2 = st.columns(2)
+    with exp1:
         st.download_button(
-            label="Download results.csv",
-            data=csv_str,
-            file_name="county_siting_results.csv",
-            mime="text/csv"
+            "📥 Download weights (JSON)",
+            data=export_weights_json(committed_weights, community_mode, normalize_weights),
+            file_name="siting_readiness_weights.json",
+            mime="application/json",
         )
-    
-    # Display sample data
-    with st.expander("📊 View Sample Data"):
-        display_cols = ['GEOID', 'County', 'composite_score', 'composite_normalized'] + [
-            f"{col}_risk" for col in SCORE_COLUMNS if f"{col}_risk" in scores_with_composite.columns
-        ]
-        
-        # Show top 10 and bottom 10 by composite score
-        st.markdown("**Top 10 Highest Risk Counties:**")
-        st.dataframe(
-            scores_with_composite[display_cols]
-            .nlargest(10, 'composite_score')
-            .reset_index(drop=True),
-            hide_index=True
+    with exp2:
+        st.download_button(
+            "📥 Download county results (CSV)",
+            data=export_results_csv(results, committed_weights),
+            file_name="county_siting_readiness_results.csv",
+            mime="text/csv",
         )
-        
-        st.markdown("**Top 10 Lowest Risk Counties:**")
-        st.dataframe(
-            scores_with_composite[display_cols]
-            .nsmallest(10, 'composite_score')
-            .reset_index(drop=True),
-            hide_index=True
-        )
-    
-    # Footer
+
+    # --- Scenario comparison ---
     st.markdown("---")
-    st.markdown("""
-    **About:** This tool helps identify optimal county-level sites by combining multiple risk factors.
-    Higher composite scores (red) indicate higher overall siting risk.
-    
-    **Scoring:** Counties are ranked as percentiles (0-100%), where a higher percentile means worse siting conditions.
-    This ensures an even distribution of scores across all counties regardless of the weighting scheme.
-    
-    **Directionality:** All factors use raw CSV values as-is (higher = higher risk, no inversion applied).
-    """)
+    st.subheader("Scenario comparison")
+    st.caption(
+        "Compares the three default scenarios (Storage-First, Grid-Speed, "
+        "Policy-and-Permitting) using consistent extent, binning, palette and legend. "
+        "The current Community Context Layer setting is applied to each scenario."
+    )
+    if st.button("📊 Compare 3 scenarios"):
+        with st.spinner("Computing scenario comparison..."):
+            geojson_dict, counties_meta = build_geojson(include_territories)
+            figs = {}
+            for name in SCENARIO_ORDER:
+                sc_weights = dict(SCENARIOS[name])
+                sc_weights[COMMUNITY_COLUMN] = (
+                    community_weight if community_mode != COMMUNITY_NOT_INCLUDED else 0.0
+                )
+                sc_results = compute_index(scores_df, sc_weights, community_mode, normalize_weights)
+                sc_edges = compute_bin_edges(
+                    sc_results['composite_normalized'].values,
+                    bin_mode, bin_size, n_bins, quantile_bins,
+                )
+                figs[name] = make_choropleth_map(
+                    geojson_dict, counties_meta, sc_results, sc_edges, palette,
+                    title=name, height=450, show_colorbar=True,
+                )
+        st.session_state["scenario_figs"] = figs
+
+    if "scenario_figs" in st.session_state:
+        figs = st.session_state["scenario_figs"]
+        top_left, top_right = st.columns(2)
+        with top_left:
+            st.plotly_chart(figs[SCENARIO_ORDER[0]], use_container_width=True)
+        with top_right:
+            st.plotly_chart(figs[SCENARIO_ORDER[1]], use_container_width=True)
+        _, bottom_center, _ = st.columns([1, 2, 1])
+        with bottom_center:
+            st.plotly_chart(figs[SCENARIO_ORDER[2]], use_container_width=True)
+
+    # --- Sample data ---
+    with st.expander("📊 View sample data"):
+        display_cols = ['GEOID']
+        if 'County' in results.columns:
+            display_cols.append('County')
+        display_cols += ['composite_score', 'composite_normalized']
+        display_cols += [c for c in RAW_COLUMNS if c in results.columns]
+
+        st.markdown("**Top 10 highest-readiness counties (lowest index):**")
+        st.dataframe(
+            results[display_cols].nsmallest(10, 'composite_normalized').reset_index(drop=True),
+            hide_index=True,
+        )
+        st.markdown("**Top 10 lowest-readiness counties (highest index):**")
+        st.dataframe(
+            results[display_cols].nlargest(10, 'composite_normalized').reset_index(drop=True),
+            hide_index=True,
+        )
+
+    # --- Footer ---
+    st.markdown("---")
+    st.markdown(
+        "**About:** This tool combines multiple indicators into a single **County "
+        "Siting Readiness Index**. Lower scores indicate higher readiness; higher "
+        "scores indicate lower readiness / greater deployment constraint.\n\n"
+        "**Scenarios:** The three default scenarios correspond to Storage-First, "
+        "Grid-Speed, and Policy-and-Permitting readiness. The Community Context Layer "
+        "is optional and can be explored as either a Social Vulnerability perspective "
+        "(greater need for safeguards) or an Economic Development Need perspective "
+        "(greater development priority)."
+    )
 
 
 if __name__ == "__main__":

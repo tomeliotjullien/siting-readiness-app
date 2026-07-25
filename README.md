@@ -1,23 +1,31 @@
-# Interactive County Siting Score Visualization
+# County Siting Readiness Index — Interactive Visualization
 
-A Streamlit-based interactive tool for visualizing county-level siting risk scores across the United States.
+A Streamlit-based interactive tool for visualizing the **County Siting Readiness Index**
+across United States counties.
+
+The index is interpreted as:
+
+- **lower score = higher readiness**
+- **higher score = lower readiness / greater deployment constraint**
 
 ## Features
 
-- **9 Adjustable Weight Sliders**: Control the importance of each siting factor
-- **Live-Updating Choropleth Map**: See changes instantly as you adjust weights
-- **Smart Directionality**: Automatically handles "higher=better" vs "higher=worse" conventions
-- **Interactive Hover**: View detailed scores for each county
-- **Export Capabilities**: Save your weight configurations and results
-- **Territory Toggle**: Include/exclude Alaska, Hawaii, and Puerto Rico
-- **Multiple Color Scales**: Choose your preferred visualization style
+- **Three default scenarios**: Storage-First, Grid-Speed, and Policy-and-Permitting readiness
+- **Optional Community Context Layer**: explore social vulnerability as either a need for
+  additional safeguards or an indicator of economic development need
+- **Adjustable indicator weights**: fine-tune each indicator; active weights are normalized to sum to 1
+- **Deferred rendering**: sliders update session state only; the map recomputes when you click **Update map**
+- **Flexible binning**: fixed bin size or number of bins, score-based (default) or quantile
+- **Colorblind-friendly palettes**: no red-green scales
+- **Scenario comparison**: view all three default scenarios side by side
+- **Export**: save weight configurations (JSON) and county results (CSV)
 
 ## Quick Start
 
 ### 1. Install Dependencies
 
 ```bash
-pip install -r requirements_slider_map.txt
+pip install -r requirements.txt
 ```
 
 Or install individually:
@@ -31,140 +39,118 @@ pip install streamlit pandas geopandas plotly requests shapely
 streamlit run slider_map.py
 ```
 
-The app will open in your default web browser at `http://localhost:8501`
+The app opens at `http://localhost:8501`.
 
 ### 3. Load Your Data
 
-The app expects a CSV file with the following columns:
-- `County` - County name (e.g., "Autauga County, AL")
-- `FIPS` or `GEOID` - 4 or 5-digit FIPS code (will be zero-padded to 5 digits)
-- 9 score columns (values 0-1):
-  1. Social Vulnerability
-  2. Climate Vulnerability
-  3. Labor Availability
-  4. Water Availability
-  5. Sequestration Access (EOR/Pipeline/Primacy)
-  6. Interconnection Queue
-  7. Land Cost
-  8. State Project Enablement Index
-  9. Fiber Gigabit Availability (1 - %)
+The app expects a CSV with:
+- `County` — County name
+- `FIPS` or `GEOID` — FIPS code (zero-padded to 5 digits)
+- Indicator columns (values 0–1), using the raw CSV column names:
+  1. `Community Context PCT` (optional Community Context Layer)
+  2. `State Project Enablement Index PCT`
+  3. `Interconnection Queue`
+  4. `Relevant Workforce Availability`
+  5. `Land Cost`
+  6. `Long-Haul Fiber Optics Presence`
+  7. `Extreme Events (Wildfires, Floodings, Storms) PCT`
+  8. `Water Availability`
+  9. `Sequestration Access (EOR/Pipeline/Primacy)`
 
-Place your CSV as `county_column_scores.csv` in the same directory, or use the upload feature in the app.
+Place your CSV as `county_column_scores.csv` in the same directory, or use the upload feature.
+
+The backend keeps the raw CSV column names; the UI shows clean display names via a
+`DISPLAY_NAMES` mapping (for example, `Relevant Workforce Availability` → "Labor Availability").
 
 ## How It Works
 
-### Directionality Handling
+### Scenarios
 
-The app converts all metrics to a "higher = worse" (risk) convention:
-- **Higher = Worse** (kept as-is): Social Vulnerability, Climate Vulnerability, Sequestration Access, Interconnection Queue, Land Cost, State Project Enablement Index, Fiber Gigabit Availability
-- **Higher = Better** (inverted): Labor Availability, Water Availability
+The three default scenarios set indicator weights (percentages that sum to 100). The
+Community Context Layer weight is 0 in every default scenario and is controlled separately.
 
-When "higher=better" columns are inverted using `risk = 1 - value`.
+| Indicator | Storage-First | Grid-Speed | Policy-and-Permitting |
+|---|---|---|---|
+| Community Context Layer | 0.00% | 0.00% | 0.00% |
+| State Project Enablement | 16.67% | 19.44% | 22.22% |
+| Interconnection Queue | 19.44% | 22.22% | 19.44% |
+| Labor Availability | 5.56% | 13.89% | 11.11% |
+| Land Cost | 8.33% | 11.11% | 8.33% |
+| Long-Haul Fiber Optic | 2.78% | 16.67% | 13.89% |
+| Extreme Events | 11.11% | 2.78% | 2.78% |
+| Water Availability | 13.89% | 5.56% | 5.56% |
+| Sequestration Access | 22.22% | 8.33% | 16.67% |
 
-### Composite Score Calculation
+### Community Context Layer
+
+The Community Context Layer is optional and user-controlled:
+
+- **Not included**: layer weight = 0.
+- **Social Vulnerability perspective**: higher social vulnerability increases the index
+  (lower readiness / greater need for safeguards). Raw value used as-is.
+- **Economic Development Need perspective**: the value is reversed with `1 - score`, so
+  higher social vulnerability is interpreted as greater economic development need / higher priority.
+
+### Index Calculation
 
 ```
-Composite Score = Σ(weight_i × risk_i)
+Readiness Index = Σ(weight_i × value_i)
 ```
 
-When "Normalize weights to sum = 1" is enabled (default), weights are automatically scaled so they sum to 1.
+Active weights are normalized to sum to 1 before scoring, then the composite is
+min-max normalized to `[0, 1]`.
 
 ### Map Visualization
 
-- **Red** = Higher siting risk (worse)
-- **Green** = Lower siting risk (better)
-- Color scale is customizable
-- Hover over counties to see:
-  - County name and state
-  - Composite risk score
-  - Individual component scores
-  - GEOID
+- The index is displayed with **score-based bins** (default fixed bin size = 0.2)
+- Colorblind-friendly sequential palettes (default: Cividis); low = higher readiness,
+  high = lower readiness / greater deployment constraint
+- Legend: **County Siting Readiness Index — Lower = higher readiness**
+- Hover shows county name, readiness index, and bin label
 
 ## Controls
 
-### Weight Sliders
-- Range: 0.0 to 1.0
-- Step: 0.01
-- Adjust to emphasize different factors in your siting analysis
-
-### Quick Presets
-- **Equal Weights**: Set all weights to equal values (1/9 each)
-- **Reset to 0.5**: Set all weights to 0.5
-
-### Map Options
-- **Color Scale**: Choose from 6 different color schemes
-- **Include AK/HI/PR**: Toggle visibility of Alaska, Hawaii, and Puerto Rico
-- **Rescale scores to [0,1]**: Apply min-max normalization to final scores
-
-### Export Functions
-- **Export Weights (JSON)**: Save your current weight configuration
-- **Export County Results (CSV)**: Download composite scores for all counties
+- **Scenario**: pick a default scenario (sets indicator weights) or Custom
+- **Community Context Layer**: Not included / Social Vulnerability / Economic Development Need
+- **Weight sliders**: adjust indicator weights (0–100)
+- **Map binning options**: fixed bin size or number of bins; optional quantile bins
+- **Color palette**: colorblind-friendly options
+- **Update map**: recompute the map and rankings (sliders alone do not refresh the map)
+- **Compare 3 scenarios**: render all three default scenarios together
 
 ## Data Requirements
 
 ### County Boundaries
-The app automatically downloads US Census cartographic boundary files from:
+
+The app downloads US Census cartographic boundary files once and caches them:
+
 ```
 https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_county_500k.zip
 ```
 
-This happens once and is cached for subsequent runs.
-
 ### Missing Data Handling
-- Missing values in score columns are filled with 0.5 (neutral risk)
-- The app reports how many values were filled for each column
 
-## Performance Optimization
+- Missing indicator values are filled with 0.5
+- The app reports how many values were filled per column
+
+## Performance
 
 - County geometry is downloaded once and cached
-- Only composite scores are recalculated when sliders change
-- Map uses EPSG:5070 (Albers Equal Area) for accurate CONUS visualization
-- Plotly enables interactive zooming and panning
-
-## Troubleshooting
-
-### Map doesn't appear
-- Check that you have a stable internet connection (for initial geometry download)
-- Ensure all required packages are installed
-- Check the browser console for JavaScript errors
-
-### CSV loading errors
-- Verify your CSV has a `FIPS` or `GEOID` column
-- Ensure score column names match exactly (case-sensitive)
-- Check that score values are numeric and in the range [0, 1]
-
-### Slow performance
-- Disable "Include AK/HI/PR" if not needed
-- Use a simpler color scale
-- Close other browser tabs running Streamlit apps
+- The map recomputes only when **Update map** is clicked, keeping slider interaction fast
+- Projection: EPSG:5070 (Albers Equal Area) for accurate CONUS area representation
 
 ## Technical Details
 
-- **Projection**: EPSG:5070 (Albers Equal Area) for accurate area representation
 - **Map Library**: Plotly for interactive visualization
 - **Framework**: Streamlit for reactive UI
 - **Geometry**: US Census 2023 cartographic boundaries (1:500k scale)
 
-## Advanced Usage
-
-### Custom CSV Path
-Modify the `default_csv` variable in the code or use the upload feature.
-
-### Modifying Directionality
-Edit the `DIRECTION_CONFIG` dictionary in the code to change which columns are inverted.
-
-### Adding New Score Columns
-1. Add the column name to `DIRECTION_CONFIG` with appropriate direction
-2. Ensure your CSV includes the new column
-3. The app will automatically create a slider for it
-
 ## License & Citation
 
-If you use this tool in your research, please cite appropriately and acknowledge the data sources:
+If you use this tool in your research, please cite appropriately and acknowledge:
 - US Census Bureau for county boundaries
-- Your own siting score data source
+- Your own indicator data source
 
 ---
 
-**Created**: February 2026  
 **Framework**: Streamlit + Plotly + GeoPandas
