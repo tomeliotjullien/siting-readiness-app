@@ -1307,10 +1307,7 @@ def main():
                 except Exception as e:
                     st.sidebar.error(f"Could not load mask: {e}")
 
-            title = (
-                "County Siting Readiness Index (Lower = higher readiness)"
-                f"<br><sub>Weights: {format_weights_short(weights)}</sub>"
-            )
+            title = "County Siting Readiness Index (Lower = higher readiness)"
             fig = make_choropleth_map(
                 geojson_dict, counties_meta, results, edges, palette, title,
                 binned=binned,
